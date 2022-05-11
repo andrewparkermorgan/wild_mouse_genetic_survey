@@ -1,0 +1,172 @@
+#! /usr/bin/env python
+"""
+pyadmixture.py
+Wrapper for ADMIXTURE to handle log files, multiple runs, etc.
+"""
+
+import os
+import sys
+import re
+import argparse
+import logging
+import subprocess as sp
+
+parser = argparse.ArgumentParser(description = "Wrapper and janitor for ADMIXTURE runs.")
+parser.add_argument("-b","--bfile",
+					help = "prefix for PLINK binary fileset (*.bed / *.bim / *.fam)" )
+parser.add_argument("-k","--clusters", nargs = "*", type = int,
+					default = [3],
+					help = "big K, the number of clusters [default: 3]")
+parser.add_argument("-o", "--out", type = str,
+					default = None,
+					help = "prefix for output files (if empty, will be same as input)")
+parser.add_argument("-n","--nruns", type = int,
+					default = 1,
+					help = "number of runs on same input data [default: %(default)d]")
+parser.add_argument("--supervised", action = "store_true",
+					help = "perform supervised clustering; requires *.pop file")
+parser.add_argument("--pop", type = str,
+					default = None,
+					help = "pre-specified cluster assignments for supervised mode [default: <bfile>.pop]")
+parser.add_argument("-B","--bootstrap", type = int,
+					default = 0,
+					help = "esimate standard errors with this many bootstrap replicates [default: none]")
+parser.add_argument("-P","--project", type = str,
+					help = "project new samples onto cluster x allele frequencies in this P-matrix [default: no projection]")
+parser.add_argument("-v","--verbose", action = "store_true",
+					help = "produce more detailed logging output")
+args = parser.parse_args()
+
+## set up log trace
+if args.verbose:
+	loglevel = logging.DEBUG
+else:
+	loglevel = logging.INFO
+logging.basicConfig(level = loglevel)
+logging.StreamHandler(stream = sys.stderr)
+logger = logging.getLogger()
+
+## are we projecting onto pre-estimated P matrix?
+do_project = args.project is not None
+rename_output = args.out is not None
+
+if args.nruns > 1 and do_project:
+	logger.error("No need to do multiple runs if projecting onto pre-learned P matrix.")
+	sys.exit(1)
+
+## ADMIXTURE expects input files to share a prefix, and will assign same prefix to output files
+## use symlinks to meet this requirement (and then clean up afterwars)
+to_clean = []
+in_prefix = re.sub(r"\.bed$","", os.path.abspath(args.bfile))
+logger.info("Input file prefix: {}".format(in_prefix))
+if rename_output:
+	out_prefix = os.path.abspath(args.out)
+else:
+	out_prefix = str(in_prefix)
+logger.info("Output file prefix: {}".format(out_prefix))
+#sys.exit(1)
+
+if args.supervised:
+	if not args.pop:
+		pops_file = os.path.abspath(in_prefix + ".pop")
+	else:
+		pops_file = os.path.abspath(args.pop)
+	logger.info("Running in supervised mode with training samples from <{}> ...".format(pops_file))
+else:
+	if do_project:
+		project_file = os.path.abspath(args.project)
+		logger.info("Projecting new samples onto existing (cluster x allele) frequency matrix <{}> ...".format(project_file))
+	else:
+		logger.info("Running in UNsupervised mode ...")
+
+def move_file_here(fname):
+	fn = os.path.split(fname)[-1]
+	here = os.getcwd()
+	nn = os.path.join(here, fn)
+	os.rename( fname, nn )
+
+logger.info("Values of K: {}".format(args.clusters))
+for K in args.clusters:
+	logger.info("\t... starting run with K = {} ...".format(K))
+
+	#for ii in range(0, args.nruns):
+	for ii in range(0, 1):
+
+		## if name specified for output files, symlink inputs to avoid clobbering old output with same name
+		if rename_output:
+			logger.debug("Symlinking input files ...")
+			for suffix in ["bed","bim","fam"]:
+				from_file = os.path.abspath(in_prefix + "." + suffix)
+				to_file = os.path.abspath(out_prefix + "." + suffix)
+				logger.debug("{} --> {}".format(from_file, to_file))
+				to_clean.append(to_file)
+				os.symlink(from_file, to_file)
+
+		## prepare paths to files -- THIS MAY NOT WORK
+		#if args.nruns > 1:
+		#	this_file = in_prefix + "." + "N{0:03d}".format(ii)
+		#	for suffix in ["bed","bim","fam"]:
+		#		from_file = os.path.abspath(in_prefix + "." + suffix)
+		#		to_file = os.path.abspath(this_file + "." + suffix)
+		#		if from_file != to_file:
+		#			os.symlink(from_file, to_file)
+		#	infile = this_file + ".bed"
+		#	if args.supervised:
+		#		os.symlink(pops_file, this_file + ".pop")
+		#	else:
+		#		pass
+		#else:
+
+		## for supervised clustering, symlink pop file if prefix not shared with input files
+		if args.supervised:
+			to_file = os.path.abspath(in_prefix + ".pop")
+			if to_file != pops_file:
+				to_clean.append(to_file)
+				os.symlink(pops_file, to_file)
+
+		if do_project:
+			project_file = os.path.abspath(project_file + ".{}.P".format(K))
+			p_matrix = out_prefix + ".{}.P.in".format(K)
+			p_matrix = os.path.join(os.getcwd(), os.path.split(p_matrix)[-1])
+			logger.debug("symlinking <{}> --> <{}>".format(project_file, p_matrix))
+			to_clean.append(p_matrix)
+			os.symlink(project_file, p_matrix)
+
+		## construct command
+		infile = out_prefix + ".bed"
+		supervised_flag = "" if not args.supervised else "--supervised"
+		bootstrap_flag = "" if not args.bootstrap else "-B{}".format(args.bootstrap)
+		project_flag = "" if not do_project else "-P"
+		cmd = "admixture -s {} --haploid='male:23' {} {} {} {} {}".format(10*ii, project_flag, supervised_flag, bootstrap_flag, infile, K)
+		logger.debug(cmd)
+
+		## run command
+		logger.info("\t\t... run {} of {} started".format(ii+1, args.nruns))
+		piper = sp.Popen(cmd, shell = True, stdout = sp.PIPE, stderr = sp.PIPE)
+		_out, _err = piper.communicate()
+		logger.debug(str(_err))
+		logger.debug("\t\t ... done")
+
+		## process result
+		llik_file_name = "{}.{}.llik".format(out_prefix, K)
+		log_file_name = "{}.{}.out".format(out_prefix, K)
+		Q_file_name = "{}.{}.Q".format(out_prefix, K)
+		P_file_name = "{}.{}.P".format(out_prefix, K)
+		with open(log_file_name, "w") as log_file:
+			for line in _out.decode().split("\n"):
+				print(line.strip(), file = log_file)
+				if re.match("^Loglik", line):
+					llik = float(line.strip().split().pop())
+					print(ii, K, llik, sep = "\t")
+					with open(llik_file_name, "w") as llik_file:
+						print(llik, file = llik_file)
+
+		## clean up
+		logger.debug("cleaning up these files: {}".format(to_clean))
+		for ff in to_clean:
+			os.unlink(ff)
+
+		move_file_here(llik_file_name)
+		move_file_here(log_file_name)
+		#move_file_here(Q_file_name)
+		#move_file_here(P_file_name)
